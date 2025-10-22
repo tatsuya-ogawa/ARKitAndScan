@@ -26,6 +26,7 @@ struct VertexOut {
     float4 position [[position]];
     float3 normal;
     float3 worldPosition;
+    float4 clipPosition;
 };
 
 struct Uniforms {
@@ -42,10 +43,15 @@ struct FragmentUniforms {
     float4 outlineColor;
 };
 
+struct CameraTextureUniforms {
+    float3x3 viewToImageTransform;
+};
+
 // MARK: - Camera Background Shaders
 
 vertex CameraVertexOut camera_vertex_shader(
-    uint vertexID [[vertex_id]]
+    uint vertexID [[vertex_id]],
+    constant CameraTextureUniforms &cameraUniforms [[buffer(0)]]
 ) {
     // Full-screen quad coordinates
     const float4 positions[6] = {
@@ -57,18 +63,16 @@ vertex CameraVertexOut camera_vertex_shader(
         float4( 1.0,  1.0, 0.0, 1.0)   // Top-right
     };
 
-    const float2 texCoords[6] = {
-        float2(0.0, 1.0),  // Bottom-left
-        float2(1.0, 1.0),  // Bottom-right
-        float2(0.0, 0.0),  // Top-left
-        float2(0.0, 0.0),  // Top-left
-        float2(1.0, 1.0),  // Bottom-right
-        float2(1.0, 0.0)   // Top-right
-    };
-
     CameraVertexOut out;
     out.position = positions[vertexID];
-    out.texCoord = texCoords[vertexID];
+
+    float2 viewCoord = float2(out.position.x * 0.5 + 0.5, out.position.y * 0.5 + 0.5);
+    viewCoord.y = 1.0 - viewCoord.y;
+
+    float3 homView = float3(viewCoord, 1.0);
+    float3 homImage = cameraUniforms.viewToImageTransform * homView;
+    out.texCoord = homImage.xy;
+
     return out;
 }
 
@@ -101,7 +105,9 @@ vertex VertexOut mesh_vertex_shader(
 
     float4 worldPosition = uniforms.modelMatrix * float4(in.position, 1.0);
     float4 viewPosition = uniforms.viewMatrix * worldPosition;
-    out.position = uniforms.projectionMatrix * viewPosition;
+    float4 clipPosition = uniforms.projectionMatrix * viewPosition;
+    out.position = clipPosition;
+    out.clipPosition = clipPosition;
 
     // Transform normal to world space
     float3x3 normalMatrix = float3x3(uniforms.modelMatrix[0].xyz,
@@ -118,8 +124,36 @@ vertex VertexOut mesh_vertex_shader(
 fragment float4 mesh_fragment_shader(
     VertexOut in [[stage_in]],
     float3 barycentricCoord [[barycentric_coord]],
-    constant FragmentUniforms &uniforms [[buffer(0)]]
+    constant FragmentUniforms &uniforms [[buffer(0)]],
+    constant CameraTextureUniforms &cameraUniforms [[buffer(1)]],
+    texture2d<float, access::sample> textureY [[texture(0)]],
+    texture2d<float, access::sample> textureCbCr [[texture(1)]]
 ) {
+    constexpr sampler colorSampler(mip_filter::linear, mag_filter::linear, min_filter::linear);
+
+    float2 ndc = in.clipPosition.xy / in.clipPosition.w;
+    float2 viewCoord = float2(ndc.x * 0.5 + 0.5, ndc.y * 0.5 + 0.5);
+    viewCoord.y = 1.0 - viewCoord.y;
+
+    float3 homView = float3(viewCoord, 1.0);
+    float3 homImage = cameraUniforms.viewToImageTransform * homView;
+    float2 imageCoord = homImage.xy;
+
+    bool hasValidUV =
+        imageCoord.x >= 0.0 && imageCoord.x <= 1.0 &&
+        imageCoord.y >= 0.0 && imageCoord.y <= 1.0;
+
+    float3 cameraColor = float3(0.8, 0.8, 0.9);
+    if (hasValidUV) {
+        float y = textureY.sample(colorSampler, imageCoord).r;
+        float2 uv = textureCbCr.sample(colorSampler, imageCoord).rg - float2(0.5, 0.5);
+
+        float r = y + 1.5748f * uv.y;
+        float g = y - 0.1873f * uv.x - 0.4681f * uv.y;
+        float b = y + 1.8556f * uv.x;
+        cameraColor = clamp(float3(r, g, b), 0.0, 1.0);
+    }
+
     // Simple lighting calculation
     float3 lightDirection = normalize(float3(0.5, 1.0, 0.5));
     float3 normal = normalize(in.normal);
@@ -127,8 +161,7 @@ fragment float4 mesh_fragment_shader(
     float diffuse = max(dot(normal, lightDirection), 0.0);
     float ambient = 0.3;
 
-    float3 baseColor = float3(0.8, 0.8, 0.9);
-    float3 shadedColor = baseColor * (ambient + diffuse * 0.7);
+    float3 shadedColor = cameraColor * (ambient + diffuse * 0.7);
 
     // Edge detection using barycentric coordinates
     float3 width = fwidth(barycentricCoord);

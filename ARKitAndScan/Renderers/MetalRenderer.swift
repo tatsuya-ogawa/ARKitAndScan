@@ -30,6 +30,10 @@ struct MeshFragmentUniforms {
     var outlineColor: SIMD4<Float>
 }
 
+struct CameraTextureUniforms {
+    var viewToImageTransform: simd_float3x3
+}
+
 class MetalRenderer: NSObject {
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
@@ -60,6 +64,9 @@ class MetalRenderer: NSObject {
         outlineSoftness: 1.0,
         baseOpacity: 1.0,
         outlineColor: SIMD4<Float>(0.0, 0.0, 0.0, 1.0)
+    )
+    private var cameraTextureUniforms = CameraTextureUniforms(
+        viewToImageTransform: matrix_identity_float3x3
     )
 
     struct MeshBuffers {
@@ -265,6 +272,21 @@ class MetalRenderer: NSObject {
 
     // MARK: - Rendering
 
+    private func viewToImageTransform(
+        for frame: ARFrame,
+        orientation: UIInterfaceOrientation,
+        viewportSize: CGSize
+    ) -> simd_float3x3 {
+        let displayTransform = frame.displayTransform(for: orientation, viewportSize: viewportSize)
+        let inverted = displayTransform.inverted()
+
+        return simd_float3x3(
+            SIMD3(Float(inverted.a), Float(inverted.b), 0.0),
+            SIMD3(Float(inverted.c), Float(inverted.d), 0.0),
+            SIMD3(Float(inverted.tx), Float(inverted.ty), 1.0)
+        )
+    }
+
     private func drawFrame(_ frame: ARFrame, in view: MTKView) {
 
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
@@ -275,17 +297,44 @@ class MetalRenderer: NSObject {
 
         attachErrorLogging(to: commandBuffer)
 
-        // 1. Render camera background
-        if let textureY = createTexture(from: frame.capturedImage, pixelFormat: .r8Unorm, planeIndex: 0),
-           let textureCbCr = createTexture(from: frame.capturedImage, pixelFormat: .rg8Unorm, planeIndex: 1) {
+        let interfaceOrientation = currentInterfaceOrientation(for: view)
+        let viewMatrix = frame.camera.viewMatrix(for: interfaceOrientation)
+        let projectionMatrix = frame.camera.projectionMatrix(
+            for: interfaceOrientation,
+            viewportSize: view.drawableSize,
+            zNear: 0.001,
+            zFar: 1000
+        )
 
-            renderEncoder.setRenderPipelineState(cameraPipelineState)
-            renderEncoder.setFragmentTexture(textureY, index: 0)
-            renderEncoder.setFragmentTexture(textureCbCr, index: 1)
-            renderEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+        cameraTextureUniforms.viewToImageTransform = viewToImageTransform(
+            for: frame,
+            orientation: interfaceOrientation,
+            viewportSize: view.drawableSize
+        )
+        var cameraUniforms = cameraTextureUniforms
+
+        guard let textureY = createTexture(from: frame.capturedImage, pixelFormat: .r8Unorm, planeIndex: 0),
+              let textureCbCr = createTexture(from: frame.capturedImage, pixelFormat: .rg8Unorm, planeIndex: 1) else {
+            renderEncoder.endEncoding()
+            if let drawable = view.currentDrawable {
+                commandBuffer.present(drawable)
+            }
+            commandBuffer.commit()
+            return
         }
 
-        // 2. Render meshes on top
+        // 1. Render camera background
+        renderEncoder.setRenderPipelineState(cameraPipelineState)
+        renderEncoder.setVertexBytes(
+            &cameraUniforms,
+            length: MemoryLayout<CameraTextureUniforms>.stride,
+            index: 0
+        )
+        renderEncoder.setFragmentTexture(textureY, index: 0)
+        renderEncoder.setFragmentTexture(textureCbCr, index: 1)
+        renderEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+
+        // Render meshes with camera projection
         renderEncoder.setRenderPipelineState(renderPipelineState)
         renderEncoder.setDepthStencilState(depthStencilState)
         renderEncoder.setCullMode(.back)
@@ -298,16 +347,13 @@ class MetalRenderer: NSObject {
             length: MemoryLayout<MeshFragmentUniforms>.stride,
             index: 0
         )
-
-        // Camera matrices
-        let interfaceOrientation = currentInterfaceOrientation(for: view)
-        let viewMatrix = frame.camera.viewMatrix(for: interfaceOrientation)
-        let projectionMatrix = frame.camera.projectionMatrix(
-            for: interfaceOrientation,
-            viewportSize: view.drawableSize,
-            zNear: 0.001,
-            zFar: 1000
+        renderEncoder.setFragmentBytes(
+            &cameraUniforms,
+            length: MemoryLayout<CameraTextureUniforms>.stride,
+            index: 1
         )
+        renderEncoder.setFragmentTexture(textureY, index: 0)
+        renderEncoder.setFragmentTexture(textureCbCr, index: 1)
 
         // Render each mesh
         for (_, meshBuffers) in meshAnchors {
